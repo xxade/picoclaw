@@ -4,6 +4,119 @@ import (
 	"strings"
 )
 
+// gfmTableBlock locates a GFM pipe table (header + separator + rows) that sits
+// outside fenced code blocks. All offsets are rune indices.
+type gfmTableBlock struct {
+	lineStart int    // first rune of the header line
+	headerEnd int    // first rune after the header line's newline
+	sepEnd    int    // first rune after the separator line's newline
+	end       int    // first rune after the last table row
+	header    string // header line without its newline
+	sep       string // separator line without its newline
+}
+
+// findGFMTableBlocks scans runes[start:] for GFM tables outside code fences.
+// Only leading-pipe rows are treated as table rows, which is what markdown
+// emitting LLMs produce and keeps the scan conservative.
+func findGFMTableBlocks(runes []rune, start, end int) []gfmTableBlock {
+	type line struct {
+		text       string
+		start, end int
+	}
+	var lines []line
+	pos := start
+	for pos < end {
+		idx := pos
+		for idx < end && runes[idx] != '\n' {
+			idx++
+		}
+		lineEnd := idx + 1
+		if lineEnd > end {
+			lineEnd = end
+		}
+		lines = append(lines, line{string(runes[pos:lineEnd]), pos, lineEnd})
+		pos = lineEnd
+	}
+
+	var blocks []gfmTableBlock
+	inFence := false
+	for i := 0; i+1 < len(lines); i++ {
+		t := strings.TrimSpace(lines[i].text)
+		if strings.HasPrefix(t, "```") || strings.HasPrefix(t, "~~~") {
+			inFence = !inFence
+			continue
+		}
+		if inFence {
+			continue
+		}
+		if isTableRowLine(t) && isTableSepLine(strings.TrimSpace(lines[i+1].text)) {
+			j := i + 2
+			for j < len(lines) && isTableRowLine(strings.TrimSpace(lines[j].text)) {
+				j++
+			}
+			blocks = append(blocks, gfmTableBlock{
+				lineStart: lines[i].start,
+				headerEnd: lines[i].end,
+				sepEnd:    lines[i+1].end,
+				end:       lines[j-1].end,
+				header:    strings.TrimRight(lines[i].text, "\r\n"),
+				sep:       strings.TrimRight(lines[i+1].text, "\r\n"),
+			})
+			i = j - 1
+		}
+	}
+	return blocks
+}
+
+// tableCutAt reports the GFM table that runes[start:totalLen] contains with a
+// boundary at msgEnd cutting through it (between the header and the last row).
+// Returns nil when msgEnd does not cut a table.
+func tableCutAt(runes []rune, start, totalLen, msgEnd int) *gfmTableBlock {
+	for _, b := range findGFMTableBlocks(runes, start, totalLen) {
+		if msgEnd > b.lineStart && msgEnd < b.end {
+			return &b
+		}
+	}
+	return nil
+}
+
+// lastNewlineAtMost returns the index just after the last newline in
+// runes[from:to], or from when there is none.
+func lastNewlineAtMost(runes []rune, from, to int) int {
+	for i := to - 1; i >= from; i-- {
+		if runes[i] == '\n' {
+			return i + 1
+		}
+	}
+	return from
+}
+
+func isTableRowLine(trimmed string) bool {
+	return strings.HasPrefix(trimmed, "|") && strings.Count(trimmed, "|") >= 2
+}
+
+func isTableSepLine(trimmed string) bool {
+	if !strings.HasPrefix(trimmed, "|") {
+		return false
+	}
+	cells := strings.Split(strings.Trim(trimmed, "|"), "|")
+	if len(cells) < 2 {
+		return false
+	}
+	for _, c := range cells {
+		c = strings.TrimSpace(c)
+		if c == "" {
+			continue
+		}
+		for _, r := range c {
+			if r != '-' && r != ':' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 // SplitMessage splits long messages into chunks, preserving code block integrity.
 // The maxLen parameter is measured in runes (Unicode characters), not bytes.
 // The function reserves a buffer (10% of maxLen, min 50) to leave room for closing code blocks,
@@ -126,6 +239,23 @@ func SplitMessage(content string, maxLen int) []string {
 
 		if msgEnd <= start {
 			msgEnd = start + effectiveLimit
+		}
+
+		// Never cut a GFM table mid-row: a fragment without its header line
+		// renders as loose pipe text instead of a table. Prefer moving the
+		// boundary before the whole table; if the table alone cannot fit one
+		// chunk, split at a row boundary and re-open the header in the next
+		// chunk so every fragment stays a valid table.
+		if cut := tableCutAt(runes, start, totalLen, msgEnd); cut != nil {
+			if cut.lineStart > start {
+				msgEnd = cut.lineStart
+			} else if rowEnd := lastNewlineAtMost(runes, cut.sepEnd, msgEnd); rowEnd > cut.sepEnd {
+				messages = append(messages, strings.TrimRight(string(runes[start:rowEnd]), " 	\r\n"))
+				runes = []rune(cut.header + "\n" + cut.sep + "\n" + string(runes[rowEnd:totalLen]))
+				totalLen = len(runes)
+				start = 0
+				continue
+			}
 		}
 
 		messages = append(messages, string(runes[start:msgEnd]))
