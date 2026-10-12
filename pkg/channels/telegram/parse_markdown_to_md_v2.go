@@ -1,6 +1,7 @@
 package telegram
 
 import (
+	"fmt"
 	"regexp"
 	"strings"
 )
@@ -70,10 +71,21 @@ var allEntityPatterns = []entityPattern{
 var verbatimEntities = map[string]bool{
 	"```": true,
 	"`":   true,
-	"**>": true,
-	">":   true,
 	"!":   true,
 	"[":   true,
+}
+
+// quoteEntities keep their opening marker but their body is normal text:
+// MarkdownV2 still requires special-character escaping inside a block quote
+// (e.g. an unescaped '.' makes Telegram reject the whole message).
+var quoteEntities = map[string]bool{
+	"**>": true,
+	">":   true,
+}
+
+// quoteMarkerLen returns the length of the block-quote marker.
+func quoteMarkerLen(open string) int {
+	return len(open)
 }
 
 // markdownToTelegramMarkdownV2 converts a Markdown string into a string safe
@@ -89,6 +101,21 @@ var verbatimEntities = map[string]bool{
 //
 // Reference: https://core.telegram.org/bots/api#formatting-options
 func markdownToTelegramMarkdownV2(text string) string {
+	// Protect fenced code blocks (kept verbatim, language tag included) and
+	// inline code first: heading/bold rewriting below must never touch code
+	// content (a '#' comment inside a fence would otherwise become a bold
+	// span).
+	var fences []string
+	text = reFenceFull.ReplaceAllStringFunc(text, func(m string) string {
+		fences = append(fences, m)
+		return fmt.Sprintf("\x00FB%d\x00", len(fences)-1)
+	})
+	var codes []string
+	text = reInlineCodeFull.ReplaceAllStringFunc(text, func(m string) string {
+		codes = append(codes, m)
+		return fmt.Sprintf("\x00FC%d\x00", len(codes)-1)
+	})
+
 	// 1. Convert Markdown headings → *escaped heading text*
 	text = reHeading.ReplaceAllStringFunc(text, func(match string) string {
 		sub := reHeading.FindStringSubmatch(match)
@@ -104,8 +131,26 @@ func markdownToTelegramMarkdownV2(text string) string {
 	text = reBoldStar.ReplaceAllString(text, "*$1*")
 
 	// 3. Recursively escape the full string.
-	return processText(text)
+	result := processText(text)
+
+	// 4. Restore inline code and code blocks verbatim.
+	for i, code := range codes {
+		result = strings.ReplaceAll(result, fmt.Sprintf("\x00FC%d\x00", i), code)
+	}
+	for i, fence := range fences {
+		result = strings.ReplaceAll(result, fmt.Sprintf("\x00FB%d\x00", i), fence)
+	}
+
+	return result
 }
+
+var (
+	// reFenceFull matches a complete fenced block including the ``` delimiters
+	// and optional language tag.
+	reFenceFull = regexp.MustCompile("(?s)```[\\w]*\\n[\\s\\S]*?```|```[\\w]*```")
+	// reInlineCodeFull matches a complete inline code span including backticks.
+	reInlineCodeFull = regexp.MustCompile("`(?:[^`\\\n]|\\\\.)*`")
+)
 
 // processText walks `text`, finds the leftmost / longest matching entity,
 // escapes the gap before it, processes the entity (recursing into its inner
@@ -150,8 +195,21 @@ func processText(text string) string {
 	matched := text[bestStart:bestEnd]
 
 	if verbatimEntities[bestPat.open] {
-		// Code blocks, URLs, quotes: pass through completely untouched.
+		// Code blocks, URLs: pass through completely untouched.
 		b.WriteString(matched)
+	} else if quoteEntities[bestPat.open] {
+		// Block quotes: keep the marker, escape the body like plain text.
+		// A trailing "||" is the expandable-quote end marker, not a spoiler
+		// delimiter, and must stay verbatim.
+		body := matched[quoteMarkerLen(bestPat.open):]
+		suffix := ""
+		if strings.HasSuffix(body, "||") {
+			body = strings.TrimSuffix(body, "||")
+			suffix = "||"
+		}
+		b.WriteString(matched[:quoteMarkerLen(bestPat.open)])
+		b.WriteString(processText(body))
+		b.WriteString(suffix)
 	} else {
 		// Inline formatting (bold, italic, underline, strikethrough, spoiler):
 		// keep the delimiters and recursively process the inner content so that

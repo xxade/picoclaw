@@ -46,6 +46,17 @@ func markdownToTelegramHTML(text string) string {
 
 	text = reStrike.ReplaceAllString(text, "<s>$1</s>")
 
+	// single-star italic: *text* (double-star bold is already consumed above).
+	// RE2 has no lookaround, so groups 1 and 3 keep the surrounding
+	// characters and are re-emitted verbatim.
+	text = reItalicStar.ReplaceAllStringFunc(text, func(s string) string {
+		match := reItalicStar.FindStringSubmatch(s)
+		if len(match) < 4 {
+			return s
+		}
+		return match[1] + "<i>" + match[2] + "</i>" + match[3]
+	})
+
 	text = reListItem.ReplaceAllString(text, "• ")
 
 	for i, lnk := range links.links {
