@@ -154,12 +154,13 @@ func newTestChannelWithConstructor(
 	)
 	base.SetRunning(true)
 
+	richOff := false
 	return &TelegramChannel{
 		BaseChannel: base,
 		bot:         bot,
 		chatIDs:     make(map[string]int64),
 		bc:          &config.Channel{Type: config.ChannelTelegram, Enabled: true},
-		tgCfg:       &config.TelegramSettings{},
+		tgCfg:       &config.TelegramSettings{RichFormat: &richOff},
 		progress:    channels.NewToolFeedbackAnimator(nil),
 	}
 }

@@ -548,6 +548,16 @@ type TelegramSettings struct {
 	Streaming         StreamingConfig `json:"streaming,omitzero"   yaml:"-"`
 	UseMarkdownV2     bool            `json:"use_markdown_v2"      yaml:"-"               env:"PICOCLAW_CHANNELS_TELEGRAM_USE_MARKDOWN_V2"`
 	MediaGroupDelayMS int             `json:"media_group_delay_ms" yaml:"-"               env:"PICOCLAW_CHANNELS_TELEGRAM_MEDIA_GROUP_DELAY_MS"`
+	TableMode         string          `json:"table_mode"           yaml:"-"               env:"PICOCLAW_CHANNELS_TELEGRAM_TABLE_MODE"`
+	TableMaxWidth     int             `json:"table_max_width"      yaml:"-"               env:"PICOCLAW_CHANNELS_TELEGRAM_TABLE_MAX_WIDTH"`
+	RichFormat        *bool           `json:"rich_format"          yaml:"-"               env:"PICOCLAW_CHANNELS_TELEGRAM_RICH_FORMAT"`
+}
+
+// RichFormatEnabled reports whether the Telegram rich-message renderer
+// (sendRichMessage, Bot API 10.1+) should be preferred. Enabled by default;
+// disable explicitly with "rich_format": false for legacy clients.
+func (c *TelegramSettings) RichFormatEnabled() bool {
+	return c == nil || c.RichFormat == nil || *c.RichFormat
 }
 
 type FeishuSettings struct {

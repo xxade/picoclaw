@@ -33,12 +33,15 @@ import (
 
 var (
 	reHeading    = regexp.MustCompile(`(?m)^#{1,6}\s+([^\n]+)`)
-	reBlockquote = regexp.MustCompile(`^>\s*(.*)$`)
+	reBlockquote = regexp.MustCompile(`(?m)^>\s*(.*)$`)
 	reLink       = regexp.MustCompile(`\[([^\]]+)\]\(([^)]+)\)`)
 	reBoldStar   = regexp.MustCompile(`\*\*(.+?)\*\*`)
 	reBoldUnder  = regexp.MustCompile(`__(.+?)__`)
 	reItalic     = regexp.MustCompile(`_([^_]+)_`)
 	reStrike     = regexp.MustCompile(`~~(.+?)~~`)
+	reItalicStar = regexp.MustCompile(`(^|[^*\w])\*([^*\n]+)\*([^*\w]|$)`)
+	reTaskDone   = regexp.MustCompile(`(?m)^(\s*[-*+] )\[[xX]\]\s*`)
+	reTaskOpen   = regexp.MustCompile(`(?m)^(\s*[-*+] )\[ \]\s*`)
 	reListItem   = regexp.MustCompile(`^[-*]\s+`)
 	reCodeBlock  = regexp.MustCompile("```[\\w]*\\n?([\\s\\S]*?)```")
 	reInlineCode = regexp.MustCompile("`([^`]+)`")
@@ -221,6 +224,7 @@ func (c *TelegramChannel) Send(ctx context.Context, msg bus.OutboundMessage) ([]
 	}
 
 	useMarkdownV2 := c.tgCfg.UseMarkdownV2
+	tableMode, tableMaxWidth := c.tableRenderOpts()
 
 	chatID, threadID, err := resolveTelegramOutboundTarget(msg.ChatID, &msg.Context)
 	if err != nil {
@@ -265,7 +269,26 @@ func (c *TelegramChannel) Send(ctx context.Context, msg bus.OutboundMessage) ([]
 		chunk := queue[0]
 		queue = queue[1:]
 
-		content := parseContent(chunk, useMarkdownV2)
+		// Rich messages (Bot API 10.1+): Telegram parses raw GFM markdown
+		// itself — native tables, task lists, headings, <details>. Preferred
+		// over our HTML/MarkdownV2 conversion unless disabled or known to be
+		// over rich limits (e.g. >20 table columns).
+		if !isToolFeedback && c.richEnabled() && !richContentUnsupported(chunk) {
+			msgID, err := c.sendRichText(ctx, chatID, threadID, chunk, replyToID)
+			if err == nil {
+				messageIDs = append(messageIDs, strconv.Itoa(msgID))
+				replyToID = ""
+				continue
+			}
+			if !richParseFailure(err) {
+				return nil, fmt.Errorf("telegram send: %w", channels.ErrTemporary)
+			}
+			logger.WarnCF("telegram", "rich message rejected, falling back to legacy parsing", map[string]any{
+				"error": err.Error(),
+			})
+		}
+
+		content := parseContentWithTables(chunk, useMarkdownV2, tableMode, tableMaxWidth)
 
 		if len([]rune(content)) > 4096 {
 			if isToolFeedback {
@@ -452,7 +475,22 @@ func (c *TelegramChannel) EditMessage(ctx context.Context, chatID string, messag
 	if err != nil {
 		return err
 	}
-	parsedContent := parseContent(content, useMarkdownV2)
+	tableMode, tableMaxWidth := c.tableRenderOpts()
+	if c.richEnabled() && !richContentUnsupported(content) {
+		if err := c.editRichMessage(ctx, cid, mid, content); err == nil {
+			return nil
+		} else if !richParseFailure(err) {
+			if strings.Contains(err.Error(), "message is not modified") {
+				return nil
+			}
+			return err
+		} else {
+			logger.WarnCF("telegram", "rich edit rejected, falling back to legacy parsing", map[string]any{
+				"error": err.Error(),
+			})
+		}
+	}
+	parsedContent := parseContentWithTables(content, useMarkdownV2, tableMode, tableMaxWidth)
 	editMsg := tu.EditMessageText(tu.ID(cid), mid, parsedContent)
 	if useMarkdownV2 {
 		editMsg.WithParseMode(telego.ModeMarkdownV2)
@@ -1441,6 +1479,38 @@ func (c *TelegramChannel) downloadFile(ctx context.Context, fileID, ext string) 
 }
 
 func parseContent(text string, useMarkdownV2 bool) string {
+	return parseContentWithTables(text, useMarkdownV2, tableModeAuto, defaultTableMaxWidth)
+}
+
+// tableRenderOpts returns the normalized GFM table rendering options for
+// this channel (mode: auto|code|list|off; width: columns).
+func (c *TelegramChannel) tableRenderOpts() (string, int) {
+	mode, width := tableModeAuto, defaultTableMaxWidth
+	if c != nil && c.tgCfg != nil {
+		if m := strings.ToLower(strings.TrimSpace(c.tgCfg.TableMode)); m != "" {
+			mode = m
+		}
+		if c.tgCfg.TableMaxWidth > 0 {
+			width = c.tgCfg.TableMaxWidth
+		}
+	}
+	switch mode {
+	case tableModeAuto, tableModeCode, tableModeList, tableModeOff:
+	default:
+		mode = tableModeAuto
+	}
+	return mode, width
+}
+
+// parseContentWithTables pre-renders GFM tables (which Telegram has no entity
+// for), folds HTML <details> blocks, strips stray HTML tags, and then converts
+// the result to the selected Telegram parse mode.
+func parseContentWithTables(text string, useMarkdownV2 bool, tableMode string, tableMaxWidth int) string {
+	text = renderTablesIntoMarkdown(text, tableMode, tableMaxWidth)
+	text = stripStrayHTMLTags(foldDetailsBlocks(text))
+	// task list checkboxes -> emoji (both parse modes; Telegram has no todo entity)
+	text = reTaskDone.ReplaceAllString(text, "$1✅ ")
+	text = reTaskOpen.ReplaceAllString(text, "$1⬜ ")
 	if useMarkdownV2 {
 		return markdownToTelegramMarkdownV2(text)
 	}
@@ -1663,6 +1733,7 @@ func (c *TelegramChannel) BeginStream(ctx context.Context, chatID string) (chann
 		chatID:           cid,
 		threadID:         threadID,
 		draftID:          cryptoRandInt(),
+		rich:             c.richEnabled(),
 		throttleInterval: time.Duration(streamCfg.ThrottleSeconds) * time.Second,
 		minGrowth:        streamCfg.MinGrowthChars,
 	}, nil
@@ -1676,6 +1747,7 @@ type telegramStreamer struct {
 	chatID           int64
 	threadID         int
 	draftID          int
+	rich             bool
 	throttleInterval time.Duration
 	minGrowth        int
 	lastLen          int
@@ -1700,16 +1772,26 @@ func (s *telegramStreamer) Update(ctx context.Context, content string) error {
 		return nil
 	}
 
-	htmlContent := markdownToTelegramHTML(content)
 	s.draftTouched = true
 
-	err := s.bot.SendMessageDraft(ctx, &telego.SendMessageDraftParams{
-		ChatID:          s.chatID,
-		MessageThreadID: s.threadID,
-		DraftID:         s.draftID,
-		Text:            htmlContent,
-		ParseMode:       telego.ModeHTML,
-	})
+	var err error
+	if s.rich {
+		err = s.bot.SendRichMessageDraft(ctx, &telego.SendRichMessageDraftParams{
+			ChatID:          s.chatID,
+			MessageThreadID: s.threadID,
+			DraftID:         s.draftID,
+			RichMessage:     telego.InputRichMessage{Markdown: content},
+		})
+	} else {
+		htmlContent := parseContentWithTables(content, false, tableModeAuto, defaultTableMaxWidth)
+		err = s.bot.SendMessageDraft(ctx, &telego.SendMessageDraftParams{
+			ChatID:          s.chatID,
+			MessageThreadID: s.threadID,
+			DraftID:         s.draftID,
+			Text:            htmlContent,
+			ParseMode:       telego.ModeHTML,
+		})
+	}
 	if err != nil {
 		logger.WarnCF("telegram", "sendMessageDraft failed, disabling streaming", map[string]any{
 			"error": err.Error(),
@@ -1724,7 +1806,26 @@ func (s *telegramStreamer) Update(ctx context.Context, content string) error {
 }
 
 func (s *telegramStreamer) Finalize(ctx context.Context, content string) error {
-	htmlContent := markdownToTelegramHTML(content)
+	if s.rich && !richContentUnsupported(content) {
+		_, err := s.bot.SendRichMessage(ctx, &telego.SendRichMessageParams{
+			ChatID:          tu.ID(s.chatID),
+			MessageThreadID: s.threadID,
+			RichMessage:     telego.InputRichMessage{Markdown: content},
+		})
+		if err == nil {
+			s.Cancel(ctx)
+			return nil
+		}
+		if !richParseFailure(err) {
+			return fmt.Errorf("telegram finalize: %w", err)
+		}
+		logger.WarnCF("telegram", "rich finalize rejected, falling back to HTML", map[string]any{
+			"chat_id": s.chatID,
+			"error":   err.Error(),
+		})
+	}
+
+	htmlContent := parseContentWithTables(content, false, tableModeAuto, defaultTableMaxWidth)
 	tgMsg := tu.Message(tu.ID(s.chatID), htmlContent)
 	tgMsg.MessageThreadID = s.threadID
 	tgMsg.ParseMode = telego.ModeHTML
