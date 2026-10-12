@@ -88,6 +88,50 @@ export function TelegramForm({
               placeholder="https://api.telegram.org"
             />
           </Field>
+
+          <div>
+            <SwitchCardField
+              label={t("channels.field.richFormat")}
+              hint={t("channels.form.desc.richFormat")}
+              checked={config.rich_format !== false}
+              onCheckedChange={(checked) =>
+                onChange("rich_format", checked)
+              }
+              ariaLabel={t("channels.field.richFormat")}
+            />
+          </div>
+
+          <Field
+            label={t("channels.field.tableMode")}
+            hint={t("channels.form.desc.tableMode")}
+          >
+            <Input
+              value={asString(config.table_mode)}
+              onChange={(e) => onChange("table_mode", e.target.value)}
+              placeholder="auto"
+            />
+          </Field>
+
+          <Field
+            label={t("channels.field.tableMaxWidth")}
+            hint={t("channels.form.desc.tableMaxWidth")}
+          >
+            <Input
+              value={
+                config.table_max_width != null
+                  ? String(config.table_max_width)
+                  : ""
+              }
+              onChange={(e) =>
+                onChange(
+                  "table_max_width",
+                  e.target.value === "" ? 0 : Number(e.target.value) || 0,
+                )
+              }
+              placeholder="60"
+              inputMode="numeric"
+            />
+          </Field>
         </CardContent>
       </Card>
 
